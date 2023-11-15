@@ -1,0 +1,424 @@
+---
+title: 'Seurat: Zebrafish scRNAseq'
+author: "Enya Engström"
+output:
+    html_document:
+        toc: true
+        toc_float: true
+        number_sections: true
+params:
+  coatedh5: "/Volumes/projects/Engström/Zebrafish Project/2023-03-24 Re-sequencing of samples/Cell Ranger Output/coated_count/outs/raw_feature_bc_matrix.h5"
+  uncoatedh5: "/Volumes/projects/Engström/Zebrafish Project/2023-03-24 Re-sequencing of samples/Cell Ranger Output/uncoated_count/outs/raw_feature_bc_matrix.h5"
+  zebrafishatlas: "/Volumes/projects/Engström/Zebrafish Project/input/zebrafishatlas_labelled.rds"
+  
+---
+
+# Set-up and Loading Pre-Required Libraries 
+
+```{r Set-up, include=FALSE, message = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align="center")
+set.seed(10)
+```
+
+```{r Libraries, include=FALSE, echo=FALSE}
+library(magrittr)
+library(data.table)
+library(ggplot2)
+library(cowplot)
+library(knitr)
+library(scran)
+library(clustree)
+library(sceasy)
+library(reticulate)
+library(readxl)
+library(dplyr)
+library(Seurat)
+library(Matrix)
+library(dplyr)
+library(rafalib)
+library(pheatmap)
+library(ComplexHeatmap)
+library(scPred)
+```
+
+
+# Loading 10X Files and Creating Seurat object
+
+Loading the objects generated for both the coated and uncoated samples thorugh 10X Genomics Cell Ranger pipeline.
+Merge these objects to a single Seurat Object and remove previous data (free up storage space)
+
+Make sure that your directory and filenames+path is correct.
+
+Output is a file called "all.data" which contains the merged Seurat Objects from both coated and uncoated sample.
+
+```{r Load files, include=FALSE}
+coated10x <- Seurat::Read10X_h5(filename = params$coatedh5, use.names = TRUE)
+coated <- CreateSeuratObject(coated10x, project = "coated")
+coated$type = "coated"
+
+uncoated10x <- Seurat::Read10X_h5(filename = params$uncoatedh5, use.names = TRUE)
+uncoated <- CreateSeuratObject(uncoated10x, project = "uncoated")
+uncoated$type <- "uncoated"
+
+all.data <- merge(coated, uncoated, add.cell.ids = c("coated", "uncoated"))
+
+rm(coated10x, coated, uncoated10x, uncoated)
+gc()
+
+```
+
+# Quality Control and Filter Data
+
+Here you can set filter conditions for the data.
+This can be updates as you iterate through appropriate filter conditions.
+- selected.cells = which cells you want to keep based on e.g number of genes or counts detected for that cell (# genes 200-7500, # counts <75'000)
+- selected.feat = which features (genes) you want to keep (>3 counts, remove 51g10.6, zgc:158463, mt-genes and hb-genes)
+- selected.mito = cell selection based on % of mitochondrial genes (<20%)
+
+Output is a filtered Seurat Object (filt.data) removing all cells and features not selected
+
+```{r Filtering, echo=FALSE}
+# Select features and cells
+filt.data <- all.data
+
+selected.cells <- WhichCells(filt.data, expression = nFeature_RNA > 200 & nFeature_RNA < 7500 & nCount_RNA < 75000)
+selected.feat <- rownames(filt.data)[ Matrix::rowSums(filt.data) > 3]
+
+filt.data <- subset(filt.data, features = selected.feat, cells = selected.cells)
+
+# Calculate and filter % 
+filt.data <- filt.data %>% 
+  PercentageFeatureSet(pattern = "^mt-", col.name = "percent_mito") %>%
+  PercentageFeatureSet(pattern = "^rp[sl]", col.name = "percent_ribo") %>%
+  PercentageFeatureSet(pattern = "^hb[^(p)]", col.name = "percent_hb")
+
+selected.mito <- WhichCells(filt.data, expression = percent_mito < 20)
+filt.data <- subset(filt.data, cells = selected.mito)
+
+# Find and filter over-expressed genes
+par(mar=c(4,8,2,1))
+C <- filt.data@assays$RNA@counts
+C <-  Matrix::t( Matrix::t(C) / Matrix::colSums(C) ) * 100
+most_expressed <- order(apply(C,1,median),decreasing = T)[10:1]
+boxplot(as.matrix(t(C[most_expressed,])), cex=.1, las=1, xlab="% total count per cell", col=scales::hue_pal()(10)[10:1], horizontal=TRUE)
+
+filt.data <- filt.data[ ! grepl("si:dkey-51g10.6", rownames(filt.data)), ] # highly expressed (house-keeping)
+filt.data <- filt.data[ ! grepl("zgc:158463", rownames(filt.data)), ] # highly expressed (house-keeping)
+filt.data <- filt.data[ ! grepl("^mt-", rownames(filt.data)), ] # mitochondrial genes
+
+```
+
+
+## Violin Plots of Features
+Plots that can help us iterate through filtering and also quality control + assess the data.
+
+```{r Feature plots, echo=FALSE}
+feats <- c("nFeature_RNA","nCount_RNA", "percent_mito", "percent_ribo", "percent_hb")
+
+VlnPlot(filt.data, features = feats, pt.size = 0.01, group.by = "orig.ident") + NoLegend()
+FeatureScatter(filt.data, "nCount_RNA"  , "nFeature_RNA", pt.size = .5,group.by = "orig.ident")
+
+```
+
+## Cell Cycle 
+
+Determine cell cycle for cells to ensure we don't have any specific bias using the CellCycleScoring-function in Seurat. 
+
+```{r Cell Cycle, echo=FALSE}
+filt.data <- filt.data %>%
+  NormalizeData() %>%
+  CellCycleScoring(g2m.features = tolower(cc.genes$g2m.genes),
+                 s.features = tolower(cc.genes$s.genes))
+
+```
+
+
+# Normalize, Scale and Dimentionallity Reduction of Data
+
+Perform normalization, scaling and reduction of data.
+We base the scaling and reduction on the 2000 most variable genes (features) to reduce the space with PCA (100 dimensions),
+tSNE (30 dimensions) and UMAP (30 dimensions). Number of dimensions are decided based on Elbow-plot.
+
+If removing/filtering additional data these steps needs to be repeated! 
+
+```{r Normalization, echo=FALSE}
+
+filt.data <- filt.data %>%
+  NormalizeData() %>%
+  FindVariableFeatures(selection.method = "vst", nfeatures = 2000, verbose = F, assay = "RNA") %>%
+  ScaleData(vars.to.regress = c("nFeature_RNA", "percent_mito", "S.Score","G2M.Score"), verbose = F) %>%
+  RunPCA(npcs = 100, verbose = F) %>%
+  RunTSNE(dims = 1:50) %>%
+  RunUMAP(dims = 1:50)
+
+ElbowPlot(filt.data, ndims = 100, reduction = "pca")+ggtitle("Elbow Plot of top 100 PCs")
+
+FeaturePlot(filt.data, reduction = "tsne", features = c("S.Score","G2M.Score")) & NoAxes()
+```
+
+
+# Integrate Samples
+
+The coated and the uncoated sample need to be integrated to account for potential variability between the samples. 
+We split our Seurat Object into the coated and uncoated and find variable features within each sample. The variable features that are found in both samples are used as anchors (points of integration) in order to account for potential differences. 
+
+The output from this is a new data-file (int.data) which contains filtered and integrated data
+
+```{r Integration, echo=FALSE}
+# Find anchors and integrate the samples using these anchors
+list.data <- SplitObject(filt.data, split.by = "orig.ident")
+for (i in 1:length(list.data)) {
+  list.data[[i]] <- NormalizeData(list.data[[i]], verbose = F)
+  list.data[[i]] <- FindVariableFeatures(list.data[[i]], selection.method = "vst", nfeatures = 2000, verbose = F)
+}
+anchors <- FindIntegrationAnchors(object.list = list.data, dims = 1:50, reduction = "cca")
+int.data <- IntegrateData(anchorset = anchors, dims = 1:50, new.assay.name = "CCA")
+
+# Make new scaling and reductions
+int.data <- int.data %>% 
+  ScaleData(verbose = FALSE) %>%
+  RunPCA(npcs = 100, verbose = FALSE) %>%
+  RunTSNE(dims = 1:50) %>%
+  RunUMAP(dims = 1:50)
+
+```
+
+```{r tSNE and UMAP, echo=FALSE}
+
+plot_grid(ncol = 1,
+DimPlot(int.data, reduction = "tsne", split.by = "orig.ident")+NoAxes()+ggtitle("tSNE integrated")+NoLegend(),
+DimPlot(int.data, reduction = "umap", split.by = "orig.ident")+NoAxes()+ggtitle("UMAP integrated")+NoLegend()
+)
+
+```
+
+
+# Clustering
+
+Clustering is based in nearest neighbors (k.param = # neighbours) through the FindNeighbors function, which also computes the weighted shared nearest enighbour (SNN) graph. After, the clusters are identified at various resolutions (resulting in smaller or larger communities). 
+
+We select a resolution and save it in a new object (clust.data) which is the output from this section. Currently we use: 20 neighbours and SNN resolution 0.8. 
+
+```{r Clustering, include=FALSE, message=FALSE, warning=FALSE}
+# Create kNN and SNN graph
+int.data <- FindNeighbors(int.data, dims = 1:50, k.param = 20)
+
+# Cluster identification at different resolutions
+for (res in c(0.8, 0.9, 1.0, 1.2)){
+  int.data <- FindClusters(int.data, graph.name = "CCA_snn", resolution = res , algorithm = 1)
+}
+
+sel.clust = "CCA_snn_res.1.2"
+clust.data <- SetIdent(int.data, value = sel.clust)
+# table(clust.data@active.ident)
+
+# Plot selected clustering
+feat.data <- clust.data
+# names(feat.data@assays)
+feat.data@active.assay = "RNA"
+
+```
+
+
+```{r Cluster Plot, echo=FALSE}
+plot_grid(ncol = 1,
+          DimPlot(int.data, reduction="tsne", group.by = "CCA_snn_res.1.2", label=TRUE)+ NoAxes() + NoLegend(),
+          DimPlot(int.data, reduction="umap", group.by = "CCA_snn_res.1.2", label=TRUE)+ NoAxes() + NoLegend()
+          )
+
+plot_grid(ncol = 3,
+          FeaturePlot(feat.data, reduction = "umap", features = "stab1", order = TRUE) & NoAxes() & NoLegend(),
+          FeaturePlot(feat.data, reduction = "umap", features = "stab2", order = TRUE) & NoAxes() & NoLegend(),
+          FeaturePlot(feat.data, reduction = "umap", features = "dlx5a", order = TRUE) & NoAxes() & NoLegend(),
+          FeaturePlot(feat.data, reduction = "umap", features = "lmx1bb", order = TRUE) & NoAxes() & NoLegend(),
+          FeaturePlot(feat.data, reduction = "umap", features = "hbbe3", order = TRUE) & NoAxes() & NoLegend(),
+          FeaturePlot(feat.data, reduction = "umap", features = "elavl3", order = TRUE) & NoAxes() & NoLegend(),
+          FeaturePlot(feat.data, reduction = "umap", features = "mpeg1.1", order = TRUE) & NoAxes() & NoLegend(),
+          FeaturePlot(feat.data, reduction = "umap", features = "mpx", order = TRUE) & NoAxes() & NoLegend(),
+          FeaturePlot(feat.data, reduction = "umap", features = "myod1", order = TRUE) & NoAxes() & NoLegend())
+
+
+ggsave("Panel C - Marker Gene Feature Plot.pdf")
+
+```
+
+
+# Find Marker Genes for Clusters and Differential Expression
+
+We define marker genes for each cluster and then plot a heatmap with the top 7 marker genes for each sample. 
+
+```{r Marker Genes, echo=FALSE, include=FALSE}
+marker.genes <- FindAllMarkers(clust.data, min.diff.pct = 0.2, only.pos = TRUE, max.cells.per.ident = 50, assay = "RNA")
+marker.genes <- marker.genes[marker.genes$p_val_adj < 0.05,]
+marker.genes %>% 
+  group_by(cluster)  %>% 
+  top_n(-25, p_val_adj) -> top25
+  
+# Heatmap
+marker.genes %>% 
+  group_by(cluster)  %>% 
+  top_n(-7, p_val_adj) -> top7
+
+mat <- clust.data[["RNA"]]@data[top7$gene,] %>% as.matrix()
+mat <- t(scale(t(mat)))
+cluster.anno <- clust.data@meta.data$CCA_snn_res.0.8
+col.fun = circlize::colorRamp2(c(-1, 0, 3), c("#FF00FF", "black", "#FFFF00"))
+
+HM <- Heatmap(mat, name = "Expression",  
+        column_split = factor(cluster.anno),
+        cluster_columns = FALSE,
+        show_column_dend = FALSE,
+        cluster_column_slices = TRUE,
+        column_title_gp = gpar(fontsize = 8),
+        column_gap = unit(0.5, "mm"),
+        cluster_rows = TRUE,
+        show_row_dend = FALSE,
+        col = col.fun,
+        row_names_gp = gpar(fontsize = 5),
+        column_title_rot = 90,
+        top_annotation = HeatmapAnnotation(foo = anno_block(gp = gpar(fill = scales::hue_pal()(9)))),
+        show_column_names = FALSE,
+        use_raster = TRUE,
+        raster_quality = 4)
+
+
+
+```
+
+
+```{r Heatmap Marker Genes, echo=FALSE, fig.fullwidth=TRUE, fig.height=10}
+HM
+```
+
+
+# Cell Type Prediction
+
+For the cell type prediction we first train an algorithm on a pre-annotated zebrafish atlas (taken from Zebrahub, for embroys 2dpf). This algorithm is then used to annotate the coated and uncoated cells. 
+
+
+```{r Cell Type Pred, echo=FALSE, include=FALSE}
+
+# Code for loading and training algorithm on zebrafish atlas with scPred
+# zebrafish.atlas <- zebrafish.atlas %>% NormalizeData() %>% FindVariableFeatures() %>% ScaleData() %>% RunPCA(verbose = F) %>% RunTSNE(dims = 1:30) %>% RunUMAP(dims = 1:30)
+# zebrafish.atlas <- getFeatureSpace(zebrafish.atlas, "zebrafish_anatomy_ontology_class")
+# zebrafish.atlas <- trainModel(zebrafish.atlas)
+# get_scpred(zebrafish.atlas)
+
+# Load Zebrafish Atlas (already scPred)
+zebrafish.atlas <- readRDS(params$zebrafishatlas)
+clust.data <- scPredict(clust.data,zebrafish.atlas)
+
+assign.cells <- WhichCells(clust.data, expression = scpred_prediction != "unassigned")
+clust.data <- subset(clust.data, cells = assign.cells)
+
+coated.str <- clust.data@meta.data$scpred_prediction[clust.data@meta.data$orig.ident == "coated"]
+uncoated.cells <- clust.data@meta.data$scpred_prediction[clust.data@meta.data$orig.ident == "uncoated"]
+
+coated.cells <- table(clust.data@meta.data$scpred_prediction[clust.data@meta.data$orig.ident == "coated"]) %>%
+  as.data.frame() %>%
+  arrange(-Freq) %>%
+  mutate(Perc = round(Freq*100/length(clust.data@meta.data$scpred_prediction[clust.data@meta.data$orig.ident == "coated"]),2), .after=Freq)
+
+uncoated.cells <- table(clust.data@meta.data$scpred_prediction[clust.data@meta.data$orig.ident == "uncoated"]) %>%
+  as.data.frame() %>%
+  arrange(-Freq) %>%
+  mutate(Perc = round(Freq*100/length(clust.data@meta.data$scpred_prediction[clust.data@meta.data$orig.ident == "uncoated"]),2), .after=Freq)
+
+cells.perc <- merge(coated.cells, uncoated.cells, by="Var1", all=TRUE)
+```
+
+```{r Cell type plot, echo=FALSE, fig.height=10}
+
+ggplot(clust.data@meta.data, aes(x=CCA_snn_res.0.8, fill = scpred_prediction)) + geom_bar() + theme_classic() + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))+ggtitle("Prediction from Atlas")
+```
+
+```{r Cell type plot2, echo=FALSE}
+DimPlot(clust.data, reduction = "umap", group.by = "scpred_prediction", label = F) + NoLegend() + NoAxes() + ggtitle("UMAP color by Cell Type Prediction")
+
+knitr::kable(cells.perc, caption = "Number of cells for cell type and % of total sample", 
+             col.names = c("Cell Type", "Coated #", "Coated %", "Uncoated #", "Uncoated %"))
+
+summary <- as.data.frame.matrix(table(clust.data$scpred_prediction, clust.data$CCA_snn_res.1.2))
+
+```
+
+```{r CNCCs market prediction, echo=FALSE}
+
+cnccs <- read_excel("/Volumes/projects/Engström/Zebrafish Project/input/NeuralCrest.xlsx")
+cnccs.reduced <- cnccs[c("cluster", "gene")]  
+
+cnccs.reduced$cluster[cnccs.reduced$cluster %in% c("2","5","6","8","10","12","16","17","20")] = rep("Neuronal", times=length(cnccs.reduced$cluster[cnccs.reduced$cluster %in% c("2","5","6","8","10","12","16","17","20")]))
+cnccs.reduced$cluster[cnccs.reduced$cluster %in% c("0","1","3","4","7","9","11","13","14")] = rep("Mesenchymal", times=length(cnccs.reduced$gene[cnccs.reduced$cluster %in% c("0","1","3","4","7","9","11","13","14")]))
+
+marker.genes.reduced <- marker.genes[c("cluster", "gene")]
+
+merge <- merge(cnccs.reduced, marker.genes.reduced, by="gene")
+
+neuralcrestcells <- table(merge$cluster.x, merge$cluster.y)
+
+```
+
+
+# Annotated Data
+Collectively, the scPred using annotated atlas from Zebrahub, known cell type marker genes, and marker genes from CNCCs were used to annotate the each of the clusters into distict cell types. 
+
+```{r Manually Annotate Clusters, echo=FALSE}
+
+# Annotating Cell types based on scPred, marker genes and CNCCs marker genes
+cell.type <- c("Embryonic Brain", "RBC", "Mesenchymal Neural Crest", "Scavender/Vascular Endothelial", "Embryonic Brain", "Mesenchymal Neural Crest","Mesenchymal Neural Crest", "Scavender/Vascular Endothelial", "Scavender/Vascular Endothelial", "Neuronal Neural Crest", "Neurons", "Mesenchymal Neural Crest", "Scavender/Vascular Endothelial", "Scavender/Vascular Endothelial", "Neuronal Neural Crest", "Pectoral Fin", "RBC", "Musculature System", "Immune Cells", "Pectoral Fin", "Mesenchymal Neural Crest", "RBC", "Skeletal Muscle")
+
+annot.data <- feat.data
+cell.types <- cell.type[unname(Idents(annot.data))]
+names(cell.types) <- colnames(annot.data)
+annot.data <- AddMetaData(object = annot.data, metadata <- cell.types, col.name <- "Cell_Type_Annotation")
+annot.data$orig.ident <- factor(x=annot.data$orig.ident, levels = c("uncoated", "coated"))
+
+# Plot cell types in UMAP
+DimPlot(annot.data, reduction = "umap", split.by="orig.ident", group.by = "Cell_Type_Annotation", label = F) 
+ggsave("Panel A: UMAP Cell Type (split).pdf", width=14, height = 6)
+
+# Plot cell types by % between coated and uncoated
+cell.perc.df <- annot.data@meta.data[,c("orig.ident","Cell_Type_Annotation")]
+cell.perc.df <- cell.perc.df %>% 
+  group_by(orig.ident,Cell_Type_Annotation) %>% 
+  summarise(count = n()) %>% 
+  mutate(perc = count*100/sum(count))
+
+cell.perc.df$Cell_Type_Annotation <- factor(cell.perc.df$Cell_Type_Annotation, 
+                                            levels=c("Scavender/Vascular Endothelial", "Immune Cells", "Neuronal Neural Crest", "Neurons", 
+                                                     "Embryonic Brain", "Mesenchymal Neural Crest", "Musculature System", "Skeletal Muscle", "RBC", 
+                                                     "Pectoral Fin"))
+
+cell.perc.df$orig.ident <- factor(cell.perc.df$orig.ident, levels = c("uncoated","coated"))
+
+ggplot(cell.perc.df, aes(x = factor(orig.ident), y = perc, fill = factor(orig.ident))) +
+  geom_bar(position="dodge",stat="identity", width = 0.7) + facet_wrap(cell.perc.df$Cell_Type_Annotation, scales="free", ncol=4) +
+  theme_classic() + theme(strip.text = element_text(size=8), axis.title.x=element_blank()) + labs(y="Percentage (%)", fill = "Condition")
+
+ggsave("Panel B: Cell Type Percentage.pdf", width = 10)
+
+
+
+```
+
+```{r DE Endothelial Cells, echo=FALSE}
+
+# DE analysis of Endothelial Cells
+endo.cells <- subset(annot.data, cells = colnames(annot.data)[annot.data@meta.data[,"Cell_Type_Annotation"] == "Scavender/Vascular Endothelial"])
+endo.cells <- SetIdent(endo.cells, value = "type")
+DGE.endo <- FindAllMarkers(endo.cells, log2FC.threshold = 0.2,test.use = "wilcox", min.diff.pct = 0.2, return.thresh = 0.05)
+DGE.endo %>% group_by(cluster)  %>% top_n(-15, p_val) -> top15.endo
+VlnPlot(endo.cells, features = as.character(unique(DGE.endo$gene)), ncol = 4,group.by = "type",assay = "RNA", pt.size = .1) & NoLegend()
+
+ggsave("DE Endothelial.pdf", heigh=10)
+
+```
+
+
+```{r Export Data, echo=FALSE}
+write.csv(top25, "Top 25 Marker Genes.csv")
+write.csv(neuralcrestcells, "Neural Crest Markers in Clusters.csv")
+write.csv(summary, "Cell Prediction by Cluster.csv")
+save.image(file = "Workspace.RData")
+```
+
